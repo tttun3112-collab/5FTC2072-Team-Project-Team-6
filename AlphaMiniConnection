@@ -1,0 +1,57 @@
+{route_key.upper()} stopped due to movement failure.")
+            return
+
+        await asyncio.sleep(COMMAND_DELAY)
+
+    print(f"[✓] Route {route_key.upper()} completed.\n")
+
+
+async def control_loop():
+    print("Select a route:")
+    print("A = Route to Location A")
+    print("B = Route to Location B")
+    print("C = Route to Location C")
+    print("R = Raise hands")
+    print("Q = Quit")
+
+    while True:
+        key = input("Enter command (A/B/C/R/Q): ").strip().lower()
+
+        if key in ROUTES:
+            await execute_route(key)
+
+        elif key == "r":
+            await raise_hands()
+
+        elif key == "q":
+            print("Exiting control loop...")
+            break
+
+        else:
+            print("[!] Invalid input. Use A/B/C for routes, R to raise hands, Q to quit.")
+
+
+async def main():
+    device = await search_device_by_name(ROBOT_ID, SEARCH_TIMEOUT)
+    if not device:
+        print("[Error] No robot found.")
+        return
+
+    robot = await connect_device(device)
+    if not robot:
+        print("[Error] Connection failed.")
+        return
+
+    try:
+        await enter_programming_mode()
+        await control_loop()
+    finally:
+        await shutdown()
+
+
+if name == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user.")
+        sys.exit(0)
