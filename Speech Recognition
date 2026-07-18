@@ -1,0 +1,113 @@
+"""
+AlphaMini - Speech-based Destination Recognition (Guide Robot)
+Scope: speech recognition + destination matching ONLY.
+Navigation is handled by a teammate via handle_destination().
+"""
+import asyncio
+import logging
+
+import mini.mini_sdk as MiniSdk
+from mini.dns.dns_browser import WiFiDevice
+from mini.apis.api_sound import StartPlayTTS
+from mini.apis.api_setup import StartRunProgram
+from mini.apis.api_observe import ObserveSpeechRecognise, SpeechRecogniseResponse
+
+
+# 1. CONFIG
+# 
+ROBOT_SERIAL = "00018"   # last 5+ digits of the serial on robot's back
+
+# destination_id -> list of spoken phrases that should select it.
+#   KEY   = what gets passed to navigation (keep it short/clean)
+#   VALUE = what people actually say out loud (use phrases, not bare letters)
+DESTINATIONS = {
+    "A": ["destination a", "point a", "room a", "location a", "go to a"],
+    "B": ["destination b", "point b", "room b", "location b", "go to b"],
+    "C": ["destination c", "point c", "room c", "location c", "go to c"],
+}
+
+# 
+# 2. HANDOFF — navigation teammate plugs their code in here
+# 
+def handle_destination(destination_id: str):
+    """Called once a valid destination is recognised."""
+    print(f"[NAV HANDOFF] Destination selected: {destination_id}")
+    # e.g.  navigation_module.go_to(destination_id)
+
+
+# ============================================================
+# 3. MATCHING LOGIC
+# ============================================================
+def match_destination(text: str):
+    """Return the destination_id if the heard text contains a known phrase."""
+    if not text:
+        return None
+    heard = text.strip().lower()
+    for dest_id, phrases in DESTINATIONS.items():
+        for phrase in phrases:
+            if phrase in heard:        # 'go to room a please' still matches 'room a'
+                return dest_id
+    return None
+
+
+async def speak(text: str):
+    (_, response) = await StartPlayTTS(text=text).execute()
+    return response
+
+
+# ============================================================
+# 4. SPEECH LISTENER (continuous — suits a guide robot)
+# ============================================================
+async def start_listening():
+    observer = ObserveSpeechRecognise()
+
+    def handler(msg: SpeechRecogniseResponse):
+        heard = str(msg.text)
+        print(f"Heard: '{heard}'")
+        dest = match_destination(heard)
+        if dest:
+            asyncio.create_task(on_match(dest))
+        # no match -> stay silent and keep listening
+
+    observer.set_handler(handler)
+    observer.start()
+    await asyncio.sleep(0)
+
+
+async def on_match(dest_id: str):
+    await speak(f"Okay, taking you to destination {dest_id}")
+    handle_destination(dest_id)
+    # robot keeps listening for the next request.
+    # If you want it to STOP listening during navigation, the nav teammate
+    # can hold a reference to the observer and call observer.stop() / .start().
+
+
+# ============================================================
+# 5. CONNECTION BOILERPLATE
+# ============================================================
+async def find_robot() -> WiFiDevice:
+    return await MiniSdk.get_device_by_name(ROBOT_SERIAL, 10)
+
+async def connect(device: WiFiDevice):
+    await MiniSdk.connect(device)
+    await StartRunProgram().execute()   # enter programming mode
+    await asyncio.sleep(6)              # let the robot finish its boot TTS
+
+async def shutdown():
+    await asyncio.sleep(1)
+    await MiniSdk.release()
+
+
+if name == "main":
+    MiniSdk.set_log_level(logging.INFO)
+    MiniSdk.set_robot_type(MiniSdk.RobotType.EDU)   # overseas education version
+
+    loop = asyncio.get_event_loop()
+    dev = loop.run_until_complete(find_robot())
+    if dev:
+        loop.run_until_complete(connect(dev))
+        loop.run_until_complete(start_listening())
+        loop.run_forever()   # REQUIRED: event listeners need a running loop
+        loop.run_until_complete(shutdown())
+    else:
+        print("Robot not found. Check the serial number and that PC + robot are on the same WiFi.")
