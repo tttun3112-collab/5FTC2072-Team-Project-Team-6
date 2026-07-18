@@ -1,0 +1,255 @@
+import asyncio
+import logging
+import string
+import sys
+from typing import Optional, List, Tuple
+
+import mini.mini_sdk as MiniSdk
+from mini.dns.dns_browser import WiFiDevice
+from mini.apis.api_observe import ObserveSpeechRecognise, ObserveInfraredDistance
+from mini.apis.api_sound import StartPlayTTS
+from mini.pb2.codemao_speechrecognise_pb2 import SpeechRecogniseResponse
+from mini.pb2.codemao_observeinfrareddistance_pb2 import ObserveInfraredDistanceResponse
+from mini.apis.api_action import MoveRobot, MoveRobotDirection, MoveRobotResponse
+from mini.apis.base_api import MiniApiResultType
+
+# --- Configuration ---
+ROBOT_ID = "277"  # Adjust to your specific robot suffix (e.g., "277" or "213")
+SEARCH_TIMEOUT = 10
+SLEEP_DURATION = 6
+COMMAND_DELAY = 1.0 
+OBSTACLE_THRESHOLD = 250  # mm (reduced from 500 so it doesn't trigger immediately)
+
+ROBOT_NAME = "alpha"   # wake word
+EXIT_COMMANDS = {"stop", "goodbye", "sleep"}   
+
+DESTINATIONS = {
+    "A": ["destination a", "point a", "room a", "location a"],
+    "B": ["destination b", "point b", "room b", "location b"],
+    "C": ["destination c", "point c", "room c", "location c"],
+}
+
+# --- Predefined Routes ---
+ROUTES = {
+    "a": [(MoveRobotDirection.FORWARD, 4), (MoveRobotDirection.RIGHTWARD, 2), (MoveRobotDirection.FORWARD, 3)],
+    "b": [(MoveRobotDirection.FORWARD, 5), (MoveRobotDirection.LEFTWARD, 2), (MoveRobotDirection.FORWARD, 2)],
+    "c": [(MoveRobotDirection.FORWARD, 3), (MoveRobotDirection.RIGHTWARD, 2), (MoveRobotDirection.FORWARD, 2)],
+}
+
+# Global app state
+state = {
+    "awake": False, 
+    "speaking": False,
+    "avoiding_obstacle": False  # Prevents overlapping evasion maneuvers
+}
+
+# --- Setup Robot SDK ---
+MiniSdk.set_log_level(logging.INFO)
+MiniSdk.set_robot_type(MiniSdk.RobotType.EDU)
+
+
+# --- Core Robot Actions ---
+
+async def text_to_speech(text: str):
+    """Executes TTS safely without getting interrupted by own voice."""
+    if not text or not text.strip():
+        return
+    state["speaking"] = True
+    print(f"[TTS] Saying: {text}")
+    block = StartPlayTTS(text=text.strip())
+    await block.execute()
+    await asyncio.sleep(0.5)  
+    state["speaking"] = False
+
+async def move_robot(direction: MoveRobotDirection, step: int = 1) -> bool:
+    """Wrapper to move the robot base."""
+    block = MoveRobot(step=step, direction=direction)
+    resultType, response = await block.execute()
+    
+    ok = (
+        resultType == MiniApiResultType.Success
+        and response is not None
+        and isinstance(response, MoveRobotResponse)
+        and response.isSuccess
+    )
+    if ok:
+        print(f"[✓] Moved {direction.name}, step={step}")
+    else:
+        print(f"[X] Move {direction.name} failed!")
+    return ok
+
+# --- Obstacle Avoidance Maneuver ---
+
+async def perform_avoidance_maneuver():
+    """Simple side-stepping maneuver to get around an obstacle."""
+    state["avoiding_obstacle"] = True
+    print("[Avoidance] Initiating side-step maneuver!")
+    
+    await text_to_speech("Obstacle detected.")
+    
+    # Maneuver steps: back up, dodge right, move past it, hop back left
+    await move_robot(MoveRobotDirection.BACKWARD, 1)
+    await asyncio.sleep(0.5)
+    await move_robot(MoveRobotDirection.RIGHTWARD, 2)
+    await asyncio.sleep(0.5)
+    await move_robot(MoveRobotDirection.FORWARD, 2)
+    await asyncio.sleep(0.5)
+    await move_robot(MoveRobotDirection.LEFTWARD, 2)
+    
+    print("[Avoidance] Maneuver complete. Resuming route.")
+    state["avoiding_obstacle"] = False
+
+
+# --- Navigation Engine ---
+
+async def execute_route(route_key: str):
+    route = ROUTES.get(route_key)
+    if route is None:
+        print(f"[!] Route '{route_key.upper()}' does not exist.")
+        return
+
+    print(f"\n[→] Starting Route {route_key.upper()}")
+    
+    # Start the Infrared Monitor
+    infrared_observer = ObserveInfraredDistance()
+    
+    def ir_handler(msg: ObserveInfraredDistanceResponse):
+        # Trigger evasion if something is close and we aren't already avoiding something
+        if msg.distance < OBSTACLE_THRESHOLD and not state["avoiding_obstacle"]:
+            print(f"[Infrared Alert] Obstacle closer than {OBSTACLE_THRESHOLD}mm! ({msg.distance}mm)")
+            # Create a concurrent task to step around it immediately
+            asyncio.create_task(perform_avoidance_maneuver())
+
+    infrared_observer.set_handler(ir_handler)
+    infrared_observer.start()
+    print("[Infrared] Active monitoring engaged for this route.")
+
+    # Execute the steps sequentially
+    for index, (direction, total_steps) in enumerate(route, start=1):
+        print(f"[Route {route_key.upper()}] Step {index}: {direction.name}, total steps={total_steps}")
+        
+        # We break individual macro-steps into single iterations so the robot checks 
+        # for IR triggers and finishes dodging before executing its next layout step.
+        steps_taken = 0
+        while steps_taken < total_steps:
+            # If currently dodging an object, wait here until it clears out
+            while state["avoiding_obstacle"]:
+                await asyncio.sleep(0.2)
+                
+            success = await move_robot(direction, step=1)
+            if not success:
+                print(f"[X] Route stopped due to structural movement failure.")
+                infrared_observer.stop()
+                return
+                
+            steps_taken += 1
+            await asyncio.sleep(COMMAND_DELAY)
+
+    # Clean up and turn off the IR sensor when destination reached
+    infrared_observer.stop()
+    print(f"[✓] Route {route_key.upper()} completed safely.\n")
+    await text_to_speech(f"We have arrived at destination {route_key.upper()}.")
+
+
+# --- Speech & Main Loop Logic ---
+
+def match_destination(normalized_text: str) -> Optional[str]:
+    if not normalized_text:
+        return None
+    for dest_id, phrases in DESTINATIONS.items():
+        for phrase in phrases:
+            if phrase in normalized_text:
+                return dest_id
+    return None
+
+async def speech_handler(msg: SpeechRecogniseResponse):
+    text = str(msg.text or "").strip()
+    if not text or state.get("speaking"):
+        return
+
+    lowered = text.lower().translate(str.maketrans('', '', string.punctuation)).strip()
+    print(f"[Speech] Heard: '{lowered}'")
+
+    if not state["awake"]:
+        if ROBOT_NAME in lowered:
+            state["awake"] = True
+            await text_to_speech(f"Hello! I am {ROBOT_NAME}. Where would you like to go?")
+        return
+
+    if lowered in EXIT_COMMANDS:
+        await text_to_speech("Going to sleep.")
+        state["awake"] = False
+        return
+
+    dest = match_destination(lowered)
+    if dest:
+        await text_to_speech(f"Okay, taking you to destination {dest}.")
+        await execute_route(dest.lower())
+        return
+
+    await text_to_speech("Sorry, I didn't catch that location.")
+
+async def listen_loop():
+    observe_speech = ObserveSpeechRecognise()
+    observe_speech.set_handler(lambda msg: asyncio.create_task(speech_handler(msg)))
+    observe_speech.start()
+    print(f"System ready. Say '{ROBOT_NAME}' to wake me up.")
+    await asyncio.Event().wait()
+
+
+# --- Device Management & Connection Helpers ---
+
+async def search_device_by_name(robot_suffix: str, timeout: int) -> Optional[WiFiDevice]:
+    try:
+        device = await MiniSdk.get_device_by_name(robot_suffix, timeout)
+        print(f"[Robot] Found device: {device}")
+        return device
+    except Exception as e:
+        print(f"[Error] Searching for device: {e}")
+        return None
+
+async def connect_device(device: WiFiDevice) -> bool:
+    try:
+        connected = await MiniSdk.connect(device)
+        print(f"[Robot] Connected: {connected}")
+        return connected
+    except Exception as e:
+        print(f"[Error] Connecting to device: {e}")
+        return False
+
+async def enter_programming_mode():
+    try:
+        await MiniSdk.enter_program()
+        print("[Robot] Entered programming mode")
+        await asyncio.sleep(SLEEP_DURATION)
+    except Exception as e:
+        print(f"[Error] Entering programming mode: {e}")
+
+async def shutdown():
+    try:
+        await MiniSdk.quit_program()
+        await MiniSdk.release()
+        print("[Robot] Shutdown complete")
+    except Exception as e:
+        print(f"[Error] Shutting down: {e}")
+
+
+# --- Main Loop Execution ---
+
+async def main():
+    # Looks for the ROBOT_ID variable defined at the top
+    device = await search_device_by_name(ROBOT_ID, SEARCH_TIMEOUT)
+    if device:
+        connected = await connect_device(device)
+        if connected:
+            await enter_programming_mode()
+            # Start the main automated speech listening sequence
+            await listen_loop()
+            await shutdown()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting application safely.")
+        sys.exit(0)

@@ -1,0 +1,194 @@
+import asyncio
+import logging
+import sys
+import mini.mini_sdk as MiniSdk
+from mini.dns.dns_browser import WiFiDevice
+from mini.apis.api_action import MoveRobot, MoveRobotDirection
+from mini.apis.api_sound import StartPlayTTS
+from mini.apis.api_observe import ObserveInfraredDistance
+
+# === SDK Configuration ===
+MiniSdk.set_log_level(logging.INFO)
+MiniSdk.set_robot_type(MiniSdk.RobotType.EDU)
+
+# === Project Configurations ===
+ROBOT_ID = "277"               # Change to your team's target AlphaMini ID
+SEARCH_TIMEOUT = 10
+COMMAND_DELAY = 0.6            # Delay interval to settle balance between individual steps
+OBSTACLE_THRESHOLD_MM = 250    # Distance constraint defined in the flowchart
+
+# === Predefined Simple Routes ===
+# Format: (Direction, Total Steps Required for that segment)
+ROUTES = {
+    "A": [
+        (MoveRobotDirection.FORWARD, 10),
+        (MoveRobotDirection.LEFTWARD, 3)
+    ],
+    "B": [
+        (MoveRobotDirection.FORWARD, 12),
+        (MoveRobotDirection.RIGHTWARD, 2)
+    ],
+    "C": [
+        (MoveRobotDirection.FORWARD, 15)
+    ]
+}
+
+# Global tracker updated asynchronously by the background sensor listener
+latest_distance = 9999
+
+def infrared_distance_handler(msg):
+    """Asynchronous background callback ensuring real-time distance data availability."""
+    global latest_distance
+    if msg and hasattr(msg, 'distance'):
+        latest_distance = msg.distance
+
+async def search_device_by_name(serial_number_suffix: str, timeout: int) -> WiFiDevice:
+    try:
+        result = await MiniSdk.get_device_by_name(serial_number_suffix, timeout)
+        print(f"[✓] Discovered device: {result}")
+        return result
+    except Exception as e:
+        print(f"[X] SDK Discovery Error: {e}")
+        return None
+
+async def execute_maneuver_step(direction: MoveRobotDirection, steps: int):
+    """Executes a discrete set of movement steps."""
+    block = MoveRobot(step=steps, direction=direction)
+    await block.execute()
+    await asyncio.sleep(COMMAND_DELAY)
+
+async def execute_obstacle_avoidance_maneuver():
+    """
+    Executes the exact tactical obstacle bypassing routine defined by your team's specifications:
+    2 steps right -> 7 steps forward -> 2 steps left -> 5 steps forward -> 2 steps right.
+    """
+    print("\n[🛑 PATH NOT CLEAR] Commencing active obstacle avoidance detour maneuver...")
+
+    await execute_maneuver_step(MoveRobotDirection.RIGHTWARD, 2)
+    
+    await execute_maneuver_step(MoveRobotDirection.FORWARD, 7)
+
+    await execute_maneuver_step(MoveRobotDirection.LEFTWARD, 2)
+
+    await execute_maneuver_step(MoveRobotDirection.FORWARD, 7)
+
+    await execute_maneuver_step(MoveRobotDirection.LEFTWARD, 2)
+
+    await execute_maneuver_step(MoveRobotDirection.FORWARD, 3)
+
+    await execute_maneuver_step(MoveRobotDirection.RIGHTWARD, 2)
+    
+    print("[✓] Avoidance bypass detour successfully completed. Re-entering core track alignment.\n")
+
+async def execute_route_with_sensing(route_key: str):
+    """
+    Steps through a chosen path segment-by-segment, itemizing steps one by one
+    to evaluate safety criteria before executing the structural move branch.
+    """
+    global latest_distance
+    route = ROUTES.get(route_key)
+    if not route:
+        print(f"[X] Route {route_key} does not exist.")
+        return
+
+    print(f"\n==========================================")
+    print(f"[!] Initiating Navigation Route: {route_key}")
+    print(f"==========================================")
+    
+    for direction, total_steps in route:
+        remaining_steps = total_steps
+        print(f"\n--- Segment: Heading {direction.name} | Target: {total_steps} steps ---")
+        
+        while remaining_steps > 0:
+            print(f"[Tracking] Track Progress: {remaining_steps} steps remaining on this leg. (Sensor: {latest_distance} mm)")
+            
+            # --- CORE FLOWCHART EVALUATION: IS PATH CLEAR? ---
+            if latest_distance <= OBSTACLE_THRESHOLD_MM:
+                print(f"[⚠️ OBSTACLE SENSED] Distance detected ({latest_distance}mm) <= Threshold ({OBSTACLE_THRESHOLD_MM}mm)")
+                
+                # 1. Dispatch Voice Notification Action
+                print(" -> Action: Dispatching Text-To-Speech Notification...")
+                tts_block = StartPlayTTS(text="Obstacle detected, please give way")
+                await tts_block.execute()
+                
+                # 2. Trigger the physical detour bypass maneuver
+                await execute_obstacle_avoidance_maneuver()
+                
+                # Note: We purposely do NOT decrement 'remaining_steps' here because 
+                # the robot spent its movements on a detour lane, preserving original line target.
+            
+            else:
+                # --- PATH IS CLEAR BRANCH ---
+                print(f" -> Path clear. Taking 1 progressive step {direction.name}...")
+                move_block = MoveRobot(step=1, direction=direction)
+                await move_block.execute()
+                await asyncio.sleep(COMMAND_DELAY)
+                
+                # Step was made towards the destination target, decrement counter
+                remaining_steps -= 1
+
+    print(f"\n[✓][✓][✓] Destination Reached! Route {route_key} has been fully completed.\n")
+
+async def control_loop():
+    """Menu system responding to terminal keyboard selections without freezing threads."""
+    while True:
+        print("=== AlphaMini Smart Indoor Guide Subsystem ===")
+        print("A - Run Route A (Straight Line 10 steps -> Left 3)")
+        print("B - Run Route B (Straight Line 12 steps -> Right 2)")
+        print("C - Run Route C (Straight Line 15 steps)")
+        print("Q - Terminate Control Loop")
+        print("==============================================")
+        
+        # Using a run_in_executor/to_thread approach ensures menu prompt interaction 
+        # doesn't deadlock the background asyncio runtime task loop.
+        choice = await asyncio.to_thread(input, "Select Option: ")
+        choice = choice.strip().upper()
+
+        if choice in ["A", "B", "C"]:
+            await execute_route_with_sensing(choice)
+        elif choice == "Q":
+            print("\nExiting system menu...")
+            break
+        else:
+            print("\n[X] Invalid entry selection. Please look closely at options.\n")
+
+async def main():
+    device = await search_device_by_name(ROBOT_ID, SEARCH_TIMEOUT)
+    if not device:
+        print("[Error] No AlphaMini device identified on current subnet infrastructure.")
+        return
+    
+    connected = await MiniSdk.connect(device)
+    if not connected:
+        print("[X] Socket communication layer failed to open.")
+        return
+        
+    # Bind our handler onto the SDK's infrared observation loop stream
+    observer = ObserveInfraredDistance()
+    observer.set_handler(infrared_distance_handler)
+    observer.start()
+    print("[✓] Infrared Data Background Streaming Channel Established.")
+        
+    try:
+        await MiniSdk.enter_program()
+        print("[✓] Robot acknowledged Program Runtime Execution Mode.")
+        
+        # Boot user console interface loop
+        await control_loop()
+        
+    except Exception as e:
+        print(f"[X] General Operational Exception Encountered: {e}")
+    finally:
+        print("\nShutting down streaming sensors safely...")
+        observer.stop()
+        print("Releasing AlphaMini control bindings...")
+        await MiniSdk.quit_program()
+        await MiniSdk.release()
+        print("[✓] SDK Context cleanly released. Ready for next deployment iteration.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProcess execution forcefully interrupted via user keyboard sequence.")
+        sys.exit(0)
