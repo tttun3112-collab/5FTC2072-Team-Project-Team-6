@@ -1,0 +1,175 @@
+import asyncio
+import logging
+import string
+from typing import Optional
+
+import mini.mini_sdk as MiniSdk
+from mini.dns.dns_browser import WiFiDevice
+from mini.apis.api_observe import ObserveSpeechRecognise
+from mini.apis.api_sound import StartPlayTTS
+from mini.pb2.codemao_speechrecognise_pb2 import SpeechRecogniseResponse
+
+# --- Configuration ---
+ROBOT_ID = "358"
+SEARCH_TIMEOUT = 10
+SLEEP_DURATION = 6
+
+ROBOT_NAME = "alpha"   # wake word
+EXIT_COMMANDS = {"stop", "goodbye", "sleep"}   # exact matches only
+
+# Destination map: ID (what navigation receives) -> phrases people actually say.
+# Use phrases, not bare letters — single letters like "A" are very unreliable for ASR.
+DESTINATIONS = {
+    "A": ["destination a", "point a", "room a", "location a"],
+    "B": ["destination b", "point b", "room b", "location b"],
+    "C": ["destination c", "point c", "room c", "location c"],
+}
+
+# --- Setup Robot SDK ---
+MiniSdk.set_log_level(logging.INFO)
+MiniSdk.set_robot_type(MiniSdk.RobotType.EDU)
+
+# 
+# NAVIGATION HANDOFF — teammate plugs their code in here
+# 
+def handle_destination(destination_id: str):
+    """Called once a valid destination is recognised. Navigation lives here."""
+    print(f"[NAV HANDOFF] Destination selected: {destination_id}")
+    # e.g.  navigation_module.go_to(destination_id)
+
+
+def match_destination(normalized_text: str) -> Optional[str]:
+    """Return the destination ID if a known phrase appears in the heard text."""
+    if not normalized_text:
+        return None
+    for dest_id, phrases in DESTINATIONS.items():
+        for phrase in phrases:
+            if phrase in normalized_text:   # 'go to room a please' still matches 'room a'
+                return dest_id
+    return None
+
+
+async def search_device_by_name(robot_suffix: str, timeout: int) -> Optional[WiFiDevice]:
+    try:
+        device = await MiniSdk.get_device_by_name(robot_suffix, timeout)
+        print(f"[Robot] Found device: {device}")
+        return device
+    except Exception as e:
+        print(f"[Error] Searching for device: {e}")
+        return None
+
+async def connect_device(device: WiFiDevice) -> bool:
+    try:
+        connected = await MiniSdk.connect(device)
+        print(f"[Robot] Connected: {connected}")
+        return connected
+    except Exception as e:
+        print(f"[Error] Connecting to device: {e}")
+        return False
+
+async def enter_programming_mode():
+    try:
+        await MiniSdk.enter_program()
+        print("[Robot] Entered programming mode")
+        await asyncio.sleep(SLEEP_DURATION)
+    except Exception as e:
+        print(f"[Error] Enter programming mode: {e}")
+
+async def shutdown_robot():
+    try:
+        await MiniSdk.quit_program()
+        await MiniSdk.release()
+        print("[Robot] Shutdown complete")
+    except Exception as e:
+        print(f"[Error] Shutdown: {e}")
+async def text_to_speech(text: str, state: dict):
+    """Do TTS and mark when speaking so speech recogniser ignores those."""
+    if not text or not isinstance(text, str):
+        return
+    text = text.strip()
+    if not text:
+        return
+
+    state["speaking"] = True
+    block = StartPlayTTS(text=text)
+    resp = await block.execute()
+    print(f"[TTS] Response: {resp}")
+    await asyncio.sleep(0.5)  # short buffer so speech recogniser doesn't trigger mid-speech
+    state["speaking"] = False
+
+async def speech_handler(msg: SpeechRecogniseResponse, state: dict):
+    text = str(msg.text or "").strip()
+    if not text:
+        return None
+
+    if state.get("speaking"):
+        print("[Speech Handler] Ignoring because robot is speaking.")
+        return None
+
+    # Normalize (lowercase + strip punctuation)
+    lowered = text.lower()
+    lowered = ''.join(ch for ch in lowered if ch not in string.punctuation).strip()
+    print(f"[Speech Handler] Recognized: raw='{text}' | normalized='{lowered}'")
+
+    # Wake logic (wake word can appear anywhere in a sentence)
+    if not state["awake"]:
+        if ROBOT_NAME in lowered:
+            state["awake"] = True
+            print(f"[Wake] Heard name \"{ROBOT_NAME}\". Awake now.")
+            await text_to_speech(f"Hello! I am {ROBOT_NAME}. Where would you like to go?", state)
+        return None
+
+    # Exit logic (must match EXACTLY one of the commands)
+    if lowered in EXIT_COMMANDS:
+        print("[State] Exit command detected. Will go to sleep after speaking.")
+        await text_to_speech("Going to sleep. Call my name when you need me.", state)
+        await asyncio.sleep(0.2)
+        state["awake"] = False
+        print("[State] Robot is now asleep. Listening for wake word.")
+        return None
+
+    # Destination logic
+    dest = match_destination(lowered)
+    if dest:
+        print(f"[Nav] Destination matched: {dest}")
+        await text_to_speech(f"Okay, taking you to destination {dest}.", state)
+        handle_destination(dest)
+        # Robot stays awake for the next request.
+        # If you want it to sleep after each trip instead, set: state["awake"] = False
+        return None
+
+    # No destination matched
+    await text_to_speech("Sorry, I didn't catch a destination. Please say it again.", state)
+    print("[Speech Handler] No destination matched.")
+    return None
+
+async def listen_loop():
+    observe = ObserveSpeechRecognise()
+    state = {"awake": False, "speaking": False}
+
+    def handler(msg: SpeechRecogniseResponse):
+        asyncio.create_task(speech_handler(msg, state))
+
+    observe.set_handler(handler)
+    observe.start()
+    print(f"Listening... Say \"{ROBOT_NAME}\" to wake me. "
+          f"Then say a destination (e.g. 'room A'). Say {EXIT_COMMANDS} to sleep.")
+    await asyncio.Event().wait()  # keep alive forever
+
+async def main():
+    device = await search_device_by_name(ROBOT_ID, SEARCH_TIMEOUT)
+    if not device:
+        print("[Error] No robot found.")
+        return
+
+    ok = await connect_device(device)
+    if not ok:
+        print("[Error] Connection failed.")
+        return
+
+    await enter_programming_mode()
+    await listen_loop()
+    await shutdown_robot()
+
+if name == "main":
+    asyncio.run(main())
