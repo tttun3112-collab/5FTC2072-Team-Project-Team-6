@@ -1,175 +1,152 @@
 import asyncio
 import logging
-import string
-from typing import Optional
-
+import sys
 import mini.mini_sdk as MiniSdk
 from mini.dns.dns_browser import WiFiDevice
-from mini.apis.api_observe import ObserveSpeechRecognise
-from mini.apis.api_sound import StartPlayTTS
-from mini.pb2.codemao_speechrecognise_pb2 import SpeechRecogniseResponse
+from mini.apis.api_action import MoveRobot, MoveRobotDirection
+from mini.apis.api_action import PlayAction
 
-# --- Configuration ---
-ROBOT_ID = "358"
-SEARCH_TIMEOUT = 10
-SLEEP_DURATION = 6
-
-ROBOT_NAME = "alpha"   # wake word
-EXIT_COMMANDS = {"stop", "goodbye", "sleep"}   # exact matches only
-
-# Destination map: ID (what navigation receives) -> phrases people actually say.
-# Use phrases, not bare letters — single letters like "A" are very unreliable for ASR.
-DESTINATIONS = {
-    "A": ["destination a", "point a", "room a", "location a"],
-    "B": ["destination b", "point b", "room b", "location b"],
-    "C": ["destination c", "point c", "room c", "location c"],
-}
-
-# --- Setup Robot SDK ---
+# === SDK Configuration ===
 MiniSdk.set_log_level(logging.INFO)
 MiniSdk.set_robot_type(MiniSdk.RobotType.EDU)
 
-# 
-# NAVIGATION HANDOFF — teammate plugs their code in here
-# 
-def handle_destination(destination_id: str):
-    """Called once a valid destination is recognised. Navigation lives here."""
-    print(f"[NAV HANDOFF] Destination selected: {destination_id}")
-    # e.g.  navigation_module.go_to(destination_id)
+# === Constants ===
+ROBOT_ID = "418"  # Change to your team's robot ID
+SEARCH_TIMEOUT = 10
+COMMAND_DELAY = 0.8  # Delay between individual steps
 
+# === Simple Predefined Routes ===
+# Format: (Direction, Total Steps Required)
+ROUTES = {
+    "A": [
+        (MoveRobotDirection.FORWARD, 3),
+        (MoveRobotDirection.LEFTWARD, 2)
+    ],
+    "B": [
+        (MoveRobotDirection.FORWARD, 4),
+        (MoveRobotDirection.RIGHTWARD, 1)
+    ],
+    "C": [
+        (MoveRobotDirection.BACKWARD, 2)
+    ]
+}
 
-def match_destination(normalized_text: str) -> Optional[str]:
-    """Return the destination ID if a known phrase appears in the heard text."""
-    if not normalized_text:
+class Robot:
+    def __init__(self, device: WiFiDevice):
+        self.device = device
+
+async def search_device_by_name(serial_number_suffix: str, timeout: int) -> WiFiDevice:
+    try:
+        result = await MiniSdk.get_device_by_name(serial_number_suffix, timeout)
+        print(f"[✓] Found device: {result}")
+        return result
+    except Exception as e:
+        print(f"[X] Error searching for device: {e}")
         return None
-    for dest_id, phrases in DESTINATIONS.items():
-        for phrase in phrases:
-            if phrase in normalized_text:   # 'go to room a please' still matches 'room a'
-                return dest_id
-    return None
 
+async def execute_single_step(direction: MoveRobotDirection):
+    """Executes exactly 1 single step in the specified direction."""
+    # We explicitly pass step=1 to track individual intervals
+    block = MoveRobot(step=1, direction=direction)
+    await block.execute()
+    await asyncio.sleep(COMMAND_DELAY)
 
-async def search_device_by_name(robot_suffix: str, timeout: int) -> Optional[WiFiDevice]:
-    try:
-        device = await MiniSdk.get_device_by_name(robot_suffix, timeout)
-        print(f"[Robot] Found device: {device}")
-        return device
-    except Exception as e:
-        print(f"[Error] Searching for device: {e}")
-        return None
+async def play_builtin_action(action_name: str):
+    """Plays a built-in animation (like raising hands)."""
+    block = PlayAction(action_name=action_name)
+    await block.execute()
 
-async def connect_device(device: WiFiDevice) -> bool:
-    try:
-        connected = await MiniSdk.connect(device)
-        print(f"[Robot] Connected: {connected}")
-        return connected
-    except Exception as e:
-        print(f"[Error] Connecting to device: {e}")
-        return False
-
-async def enter_programming_mode():
-    try:
-        await MiniSdk.enter_program()
-        print("[Robot] Entered programming mode")
-        await asyncio.sleep(SLEEP_DURATION)
-    except Exception as e:
-        print(f"[Error] Enter programming mode: {e}")
-
-async def shutdown_robot():
-    try:
-        await MiniSdk.quit_program()
-        await MiniSdk.release()
-        print("[Robot] Shutdown complete")
-    except Exception as e:
-        print(f"[Error] Shutdown: {e}")
-async def text_to_speech(text: str, state: dict):
-    """Do TTS and mark when speaking so speech recogniser ignores those."""
-    if not text or not isinstance(text, str):
-        return
-    text = text.strip()
-    if not text:
+async def execute_route_with_tracking(route_key: str):
+    """
+    Fetches a route and executes it while managing step counts
+    one-by-one, mirroring the logic in your flowchart.
+    """
+    route = ROUTES.get(route_key)
+    if not route:
+        print(f"[X] Route {route_key} not found.")
         return
 
-    state["speaking"] = True
-    block = StartPlayTTS(text=text)
-    resp = await block.execute()
-    print(f"[TTS] Response: {resp}")
-    await asyncio.sleep(0.5)  # short buffer so speech recogniser doesn't trigger mid-speech
-    state["speaking"] = False
+    print(f"\n[!] Starting Route {route_key}...")
 
-async def speech_handler(msg: SpeechRecogniseResponse, state: dict):
-    text = str(msg.text or "").strip()
-    if not text:
-        return None
+    # Loop through each leg/segment of the route
+    for direction, total_steps in route:
+        remaining_steps = total_steps
+        print(f"\n--- New Segment: Moving {direction.name} | Total Steps: {total_steps} ---")
 
-    if state.get("speaking"):
-        print("[Speech Handler] Ignoring because robot is speaking.")
-        return None
+        # Flowchart Decision Loop: Is remaining steps > 0?
+        while remaining_steps > 0:
+            print(f"[Tracking] Remaining steps in this direction: {remaining_steps}")
 
-    # Normalize (lowercase + strip punctuation)
-    lowered = text.lower()
-    lowered = ''.join(ch for ch in lowered if ch not in string.punctuation).strip()
-    print(f"[Speech Handler] Recognized: raw='{text}' | normalized='{lowered}'")
+            # 1. Execute 1 step
+            print(f" -> AlphaMini takes 1 step {direction.name}...")
+            await execute_single_step(direction)
 
-    # Wake logic (wake word can appear anywhere in a sentence)
-    if not state["awake"]:
-        if ROBOT_NAME in lowered:
-            state["awake"] = True
-            print(f"[Wake] Heard name \"{ROBOT_NAME}\". Awake now.")
-            await text_to_speech(f"Hello! I am {ROBOT_NAME}. Where would you like to go?", state)
-        return None
+            # 2. Decrement step count
+            remaining_steps -= 1
 
-    # Exit logic (must match EXACTLY one of the commands)
-    if lowered in EXIT_COMMANDS:
-        print("[State] Exit command detected. Will go to sleep after speaking.")
-        await text_to_speech("Going to sleep. Call my name when you need me.", state)
-        await asyncio.sleep(0.2)
-        state["awake"] = False
-        print("[State] Robot is now asleep. Listening for wake word.")
-        return None
+            # NOTE FOR TEAM: If you implement obstacle detection,
+            # you would insert the conditional check right here!
+            # e.g., if obstacle_detected(): break
 
-    # Destination logic
-    dest = match_destination(lowered)
-    if dest:
-        print(f"[Nav] Destination matched: {dest}")
-        await text_to_speech(f"Okay, taking you to destination {dest}.", state)
-        handle_destination(dest)
-        # Robot stays awake for the next request.
-        # If you want it to sleep after each trip instead, set: state["awake"] = False
-        return None
+        print(f"[✓] Segment segment finished. Remaining steps is now {remaining_steps}.")
 
-    # No destination matched
-    await text_to_speech("Sorry, I didn't catch a destination. Please say it again.", state)
-    print("[Speech Handler] No destination matched.")
-    return None
+    print(f"\n[✓][✓] Entire Route {route_key} has been completed successfully!\n")
 
-async def listen_loop():
-    observe = ObserveSpeechRecognise()
-    state = {"awake": False, "speaking": False}
+async def control_loop():
+    """Handles keyboard inputs to select routes or actions."""
+    while True:
+        print("=== AlphaMini Navigation Menu ===")
+        print("A - Route A (Forward 3 steps -> Left 2 steps)")
+        print("B - Route B (Forward 4 steps -> Right 1 step)")
+        print("C - Route C (Backward 2 steps)")
+        print("R - Raise Hands")
+        print("Q - Quit Program")
 
-    def handler(msg: SpeechRecogniseResponse):
-        asyncio.create_task(speech_handler(msg, state))
+        choice = input("Enter selection: ").strip().upper()
 
-    observe.set_handler(handler)
-    observe.start()
-    print(f"Listening... Say \"{ROBOT_NAME}\" to wake me. "
-          f"Then say a destination (e.g. 'room A'). Say {EXIT_COMMANDS} to sleep.")
-    await asyncio.Event().wait()  # keep alive forever
+        if choice in ["A", "B", "C"]:
+            # Triggers the sequential tracking function
+            await execute_route_with_tracking(choice)
+        elif choice == "R":
+            print("\n[!] Playing Action...")
+            await play_builtin_action("021")
+        elif choice == "Q":
+            print("\nExiting control loop...")
+            break
+        else:
+            print("\n[X] Invalid selection. Please try again.\n")
 
 async def main():
     device = await search_device_by_name(ROBOT_ID, SEARCH_TIMEOUT)
     if not device:
-        print("[Error] No robot found.")
+        print("[Error] No robot found. Check Wi-Fi/Robot ID.")
         return
 
-    ok = await connect_device(device)
-    if not ok:
-        print("[Error] Connection failed.")
+    connected = await MiniSdk.connect(device)
+    if not connected:
+        print("[X] Connection failed.")
         return
 
-    await enter_programming_mode()
-    await listen_loop()
-    await shutdown_robot()
+    print(f"[✓] Connected to {device.name}")
 
-if name == "main":
-    asyncio.run(main())
+    try:
+        await MiniSdk.enter_program()
+        print("[✓] Entered programming mode.")
+
+        # Run our flowchart-aligned loop
+        await control_loop()
+
+    except Exception as e:
+        print(f"[X] An error occurred: {e}")
+    finally:
+        print("\nShutting down SDK...")
+        await MiniSdk.quit_program()
+        await MiniSdk.release()
+        print("[✓] Shutdown complete.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user. Exiting safely.")
+        sys.exit(0)
