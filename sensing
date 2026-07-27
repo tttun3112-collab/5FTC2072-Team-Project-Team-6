@@ -1,0 +1,148 @@
+import asyncio
+import logging
+import sys
+import mini.mini_sdk as MiniSdk
+from mini.dns.dns_browser import WiFiDevice
+from mini.apis.api_action import MoveRobot, MoveRobotDirection
+from mini.apis.api_sound import StartPlayTTS
+from mini.apis.api_observe import ObserveInfraredDistance
+
+# === SDK Configuration ===
+MiniSdk.set_log_level(logging.INFO)
+MiniSdk.set_robot_type(MiniSdk.RobotType.EDU)
+
+# === Constants & Thresholds ===
+ROBOT_ID = "418"               # Change to your team's robot ID
+SEARCH_TIMEOUT = 10
+COMMAND_DELAY = 0.6            # Delay between individual steps
+OBSTACLE_THRESHOLD_MM = 250    # Threshold distance from your flowchart
+TEST_STEPS = 5                 # Total straight forward steps to execute
+
+# Global variable to track the latest sensor reading
+latest_distance = 9999
+
+def infrared_distance_handler(msg):
+    """Continuously updates the global distance tracking variable."""
+    global latest_distance
+    if msg and hasattr(msg, 'distance'):
+        latest_distance = msg.distance
+
+async def search_device_by_name(serial_number_suffix: str, timeout: int) -> WiFiDevice:
+    try:
+        result = await MiniSdk.get_device_by_name(serial_number_suffix, timeout)
+        return result
+    except Exception as e:
+        print(f"[X] Error finding device: {e}")
+        return None
+
+async def execute_maneuver_step(direction: MoveRobotDirection, steps: int):
+    """Helper to execute movement parts of the avoidance sequence."""
+    block = MoveRobot(step=steps, direction=direction)
+    await block.execute()
+    await asyncio.sleep(COMMAND_DELAY)
+
+async def execute_obstacle_avoidance_maneuver():
+    """
+    EXECUTES THE DETAILED OBSTACLE AVOIDANCE STEPS FROM YOUR FLOWCHART
+    Update these directions and steps to precisely match your flowchart's text blocks!
+    """
+    print("\n[🔴 MOVING TO AVOID OBSTACLE] Executing flowchart avoidance steps...")
+
+    # Example sequence matching typical flowchart side-stepping rules:
+    # 1. Side-step away from the obstacle
+    print(" -> Avoid Step 1: Side-stepping Right...")
+    await execute_maneuver_step(MoveRobotDirection.RIGHTWARD, 2)
+
+    # 2. Move past the obstacle length
+    print(" -> Avoid Step 2: Moving Forward past object...")
+    await execute_maneuver_step(MoveRobotDirection.FORWARD, 3)
+
+    # 3. Step back into the original lane alignment
+    print(" -> Avoid Step 3: Returning Leftward...")
+    await execute_maneuver_step(MoveRobotDirection.LEFTWARD, 2)
+
+    print("[✓] Avoidance maneuver sequence complete. Returning to main path logic.\n")
+
+async def test_obstacle_avoidance_loop():
+    """
+    Tracks step countdown and explicitly branches into the active
+    obstacle avoidance steps whenever the path is evaluated as NOT CLEAR.
+    """
+    global latest_distance
+    remaining_steps = TEST_STEPS
+    direction = MoveRobotDirection.FORWARD
+
+    print(f"\n=== Beginning Flowchart Test: Target {TEST_STEPS} Steps Forward ===")
+
+    while remaining_steps > 0:
+        print(f"\n[Tracking] Remaining route steps: {remaining_steps}")
+        print(f"[Sensor] Current Distance: {latest_distance} mm")
+
+        # --- FLOWCHART BRANCH: IS PATH CLEAR? ---
+        if latest_distance <= OBSTACLE_THRESHOLD_MM:
+            # PATH IS NOT CLEAR BRANCH
+            print(f"[⚠ PATH NOT CLEAR] Obstacle at {latest_distance}mm.")
+
+            # 1. Voice Notification Action
+            tts_block = StartPlayTTS(text="Obstacle detected, please give way")
+            await tts_block.execute()
+
+            # 2. Active Obstacle Avoidance Maneuver Steps Block
+            await execute_obstacle_avoidance_maneuver()
+
+            # Note for your team: Depending on if your flowchart considers the avoidance
+            # sequence as part of the total path progression or an detour lane,
+            # you can adjust whether 'remaining_steps' should be modified here.
+
+        else:
+            # PATH IS CLEAR BRANCH
+            print(f"[✓ Path Clear] Distance is safe ({latest_distance}mm). Moving 1 step forward...")
+            move_block = MoveRobot(step=1, direction=direction)
+            await move_block.execute()
+            await asyncio.sleep(COMMAND_DELAY)
+
+            # Decrement step countdown
+            remaining_steps -= 1
+
+    print("\n[✓][✓] Success! Target destination sequence finished.")
+
+async def main():
+    device = await search_device_by_name(ROBOT_ID, SEARCH_TIMEOUT)
+    if not device:
+        print("[Error] AlphaMini robot not found.")
+        return
+
+    connected = await MiniSdk.connect(device)
+    if not connected:
+        print("[X] Connection failed.")
+        return
+
+    # Initialize background sensor listener
+    observer = ObserveInfraredDistance()
+    observer.set_handler(infrared_distance_handler)
+    observer.start()
+    print("[✓] Infrared Sensor Observer Active.")
+
+    try:
+        await MiniSdk.enter_program()
+        print("[✓] Entered programming mode.")
+
+        # Run flowchart sequence logic
+        await test_obstacle_avoidance_loop()
+
+    except Exception as e:
+        print(f"[X] Error during execution: {e}")
+    finally:
+        print("\nCleaning up sensor listeners...")
+        observer.stop()
+        print("Shutting down SDK safely...")
+        await MiniSdk.quit_program()
+        await MiniSdk.release()
+        print("[✓] Shutdown complete.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted safely.")
+        sys.exit(0)
